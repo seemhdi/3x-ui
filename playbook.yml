@@ -1,0 +1,170 @@
+---
+- name: Deploy 3x-ui Panel
+  hosts: xui_servers
+  become: true
+  vars:
+    xui_install_dir: /usr/local/x-ui
+    xui_cli_path: /usr/bin/x-ui
+
+  tasks:
+    - name: Install dependencies (Ubuntu)
+      ansible.builtin.apt:
+        name:
+          - wget
+          - curl
+          - tar
+          - tzdata
+        state: present
+        update_cache: true
+      when: ansible_os_family == "Debian"
+
+    - name: Map architecture to 3x-ui release naming
+      ansible.builtin.set_fact:
+        xui_arch: "{{ arch_map[ansible_architecture] | default('unsupported') }}"
+      vars:
+        arch_map:
+          x86_64: "amd64"
+          aarch64: "arm64"
+          armv7l: "armv7"
+          i386: "386"
+          i686: "386"
+
+    - name: Fail if architecture is unsupported
+      ansible.builtin.fail:
+        msg: "The architecture {{ ansible_architecture }} is not supported by this playbook."
+      when: xui_arch == 'unsupported'
+
+    - name: Get latest 3x-ui release version
+      ansible.builtin.uri:
+        url: "https://api.github.com/repos/MHSanaei/3x-ui/releases/latest"
+        method: GET
+        return_content: true
+        body_format: json
+      register: github_release_info
+
+    - name: Set version fact
+      ansible.builtin.set_fact:
+        xui_version: "{{ github_release_info.json.tag_name }}"
+
+    - name: Check for existing installation
+      ansible.builtin.stat:
+        path: "{{ xui_install_dir }}"
+      register: xui_dir_stat
+
+    - name: Stop service and remove old directory for fresh install/update
+      block:
+        - name: Stop x-ui service
+          ansible.builtin.systemd:
+            name: x-ui
+            state: stopped
+          ignore_errors: true
+
+        - name: Remove old x-ui directory
+          ansible.builtin.file:
+            path: "{{ xui_install_dir }}"
+            state: absent
+      when: xui_dir_stat.stat.exists
+
+    - name: Download and extract 3x-ui release
+      ansible.builtin.unarchive:
+        src: "https://github.com/MHSanaei/3x-ui/releases/download/{{ xui_version }}/x-ui-linux-{{ xui_arch }}.tar.gz"
+        dest: "/usr/local/"
+        remote_src: yes
+        owner: root
+        group: root
+
+    - name: Set permissions on binaries (standard arch)
+      ansible.builtin.file:
+        path: "{{ item }}"
+        mode: "0755"
+        owner: root
+        group: root
+      loop:
+        - "{{ xui_install_dir }}/x-ui"
+        - "{{ xui_install_dir }}/bin/xray-linux-{{ xui_arch }}"
+      when: xui_arch not in ['armv5', 'armv6', 'armv7']
+
+    - name: Handle legacy arm binary naming and permissions
+      block:
+        - name: Rename xray binary for legacy arm
+          ansible.builtin.command:
+            cmd: "mv {{ xui_install_dir }}/bin/xray-linux-{{ xui_arch }} {{ xui_install_dir }}/bin/xray-linux-arm"
+            creates: "{{ xui_install_dir }}/bin/xray-linux-arm"
+
+        - name: Set permissions on binaries (legacy arm)
+          ansible.builtin.file:
+            path: "{{ item }}"
+            mode: "0755"
+            owner: root
+            group: root
+          loop:
+            - "{{ xui_install_dir }}/x-ui"
+            - "{{ xui_install_dir }}/bin/xray-linux-arm"
+      when: xui_arch in ['armv5', 'armv6', 'armv7']
+
+    - name: Install x-ui command-line tool
+      ansible.builtin.get_url:
+        url: "https://raw.githubusercontent.com/MHSanaei/3x-ui/main/x-ui.sh"
+        dest: "{{ xui_cli_path }}"
+        mode: '0755'
+        owner: root
+        group: root
+
+    - name: Generate random credentials and port for the panel
+      ansible.builtin.set_fact:
+        xui_username: "admin_{{ 1000 | random }}"
+        xui_password: "{{ lookup('password', '/dev/null length=12 chars=ascii_letters,digits') }}"
+        xui_port: "{{ 10000 + (40000 | random) }}"
+        xui_base_path: "{{ lookup('password', '/dev/null length=16 chars=ascii_letters,digits') }}"
+
+    - name: Configure 3x-ui with new credentials
+      ansible.builtin.command:
+        cmd: >
+          {{ xui_install_dir }}/x-ui setting
+          -username {{ xui_username }}
+          -password {{ xui_password }}
+          -port {{ xui_port }}
+          -webBasePath /{{ xui_base_path }}
+      changed_when: true
+
+    - name: Run database migration
+      ansible.builtin.command:
+        cmd: "{{ xui_install_dir }}/x-ui migrate"
+      changed_when: true
+
+    - name: Copy systemd service file
+      ansible.builtin.copy:
+        src: "{{ xui_install_dir }}/x-ui.service"
+        dest: "/etc/systemd/system/x-ui.service"
+        remote_src: yes
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Enable and start x-ui service
+      ansible.builtin.systemd:
+        name: x-ui
+        state: started
+        enabled: yes
+        daemon_reload: yes
+
+    - name: Get server public IP address
+      ansible.builtin.uri:
+        url: "https://api.ipify.org"
+        method: GET
+        return_content: true
+      register: public_ip
+
+    - name: Display access information
+      ansible.builtin.debug:
+        msg:
+          - "################################################################"
+          - "# ✅ 3x-ui Panel Installation Complete!"
+          - "################################################################"
+          - "#"
+          - "# Access URL: http://{{ public_ip.content }}:{{ xui_port }}/{{ xui_base_path }}"
+          - "#"
+          - "# Username: {{ xui_username }}"
+          - "# Password: {{ xui_password }}"
+          - "#"
+          - "################################################################"
